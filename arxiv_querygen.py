@@ -293,7 +293,7 @@ HTML_TEMPLATE = """
             }
         }
 
-        const PROMPT_PREFIX = `请根据我提供的文章元数据（如标题、摘要、关键词、研究问题、方法、数据集等），**先生成三个**适合作为**论文检索查询**的**中文**问题，然后对这三个问题进行分析，最后根据分析选出最符合要求的一个问题，输出使用 JSON 结构。
+        const PROMPT_PREFIX = `请根据我提供的文章元数据（如标题、摘要、关键词、研究问题、方法、数据集等），**生成三个**适合作为**论文检索查询**的**中文**问题。
 
 **核心要求：**  
 - 这些问题用于**找到相似主题、方法、数据集或领域的其他文章**，而不是对当前文章内容提出一个可被直接回答的事实性问题（例如“本文的准确率是多少？”或“作者提出了什么模型？”）。  
@@ -310,13 +310,7 @@ HTML_TEMPLATE = """
   - “本文得出的结论是什么？”（答案型问题）  
   - “哪些论文使用了本文提出的 Q-flip 协议？”（特有名词，无法召回其他论文）
 
-**输出格式：** 请严格按照以下 JSON 结构输出，不要添加额外解释：
-
-{
-  "candidate_questions": ["问题1", "问题2", "问题3"],
-  "analysis": "对这三个问题的分析（各自是否符合检索要求、可能检索到的论文类型等；时间限制不作为评价依据）",
-  "selected_question": "最终选出的最优问题"
-}
+**输出格式：** 请直接输出这三个问题，你可以使用无序列表或逐行输出，但不要添加额外解释：
 \n\n`;
 
         let isFirstLoad = true;
@@ -462,45 +456,79 @@ def process_single_prompt(prompt, title):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        payload = {
+        
+        # 清理 api_base 末尾可能的斜杠
+        api_base = api_base.rstrip('/')
+        
+        # 第一阶段：生成问题
+        payload_stage1 = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "你是一个专业的学术和研究助理。严格按照用户要求输出JSON。"},
+                {"role": "system", "content": "你是一个专业的学术和研究助理。"},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.7
         }
 
-        # 清理 api_base 末尾可能的斜杠
-        api_base = api_base.rstrip('/')
-
-        # 发送请求给大模型 API
-        response = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
+        # 发送请求一给大模型 API
+        response1 = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload_stage1, timeout=60)
+        response1.raise_for_status()
         
-        reply_json = response.json()
-        
-        # 安全地获取生成内容，防止出现 'NoneType' object is not subscriptable
-        choices = reply_json.get('choices')
-        if not choices or not isinstance(choices, list) or len(choices) == 0:
-            error_msg = "API 接口返回格式异常或包含错误"
-            return error_msg, True
+        reply_json1 = response1.json()
+        choices1 = reply_json1.get('choices')
+        if not choices1 or not isinstance(choices1, list) or len(choices1) == 0:
+            return "API 接口第1阶段返回格式异常或包含错误", True
             
-        message = choices[0].get('message', {})
-        ai_content = message.get('content')
+        ai_content1 = choices1[0].get('message', {}).get('content')
+        if not ai_content1:
+            return "大模型第1阶段返回了空内容", True
+            
+        print("\n" + "="*40 + " API 第1阶段生成内容 " + "="*40)
+        print(f"模型 ({model_name}) 返回候选问题：\n{ai_content1}")
         
-        if ai_content is None:
-            error_msg = "大模型返回了空的内容"
-            return error_msg, True
+        # 第二阶段：分析并选出最终结果
+        prompt_stage2 = (
+            "以上是你根据论文元数据生成的这三个候选检索问题。\n"
+            "现在请对这三个问题进行分析，评估它们各自是否满足作为优秀检索提问的要求（例如通用性、搜索意图代表性等，时间限制不作为评价依据）。\n"
+            "最后经过分析，选出一个符合要求且最终能被用来评估系统效果的问题。若都比较好，可随机选取一个。\n\n"
+            "请严格按照以下 JSON 数据结构输出你的回答结果，必须是一段可解析的 JSON，不需要包含任何 Markdown block 或是其他额外解释：\n"
+            "{\n"
+            '  "candidate_questions": ["问题1", "问题2", "问题3"],\n'
+            '  "analysis": "用一段连贯的话对这三个问题的优劣势和特点进行分析",\n'
+            '  "selected_question": "最终选出的那一个问题"\n'
+            "}"
+        )
         
-        # 调试信息：在控制台打印大模型返回的内容
-        print("\n" + "="*40 + " API 调试信息 " + "="*40)
-        print(f"模型 ({model_name}) 返回原始内容：\n{ai_content}")
+        payload_stage2 = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": "你是一个专业的学术和研究助理。严格按照用户要求输出JSON格式。"},
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": ai_content1},
+                {"role": "user", "content": prompt_stage2}
+            ],
+            "temperature": 0.7
+        }
+
+        response2 = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload_stage2, timeout=60)
+        response2.raise_for_status()
+        
+        reply_json2 = response2.json()
+        choices2 = reply_json2.get('choices')
+        if not choices2 or not isinstance(choices2, list) or len(choices2) == 0:
+            return "API 接口第2阶段返回格式异常或包含错误", True
+            
+        ai_content2 = choices2[0].get('message', {}).get('content')
+        if not ai_content2:
+            return "大模型第2阶段返回了空内容", True
+
+        print("\n" + "="*40 + " API 第2阶段生成内容 " + "="*40)
+        print(f"模型 ({model_name}) 返回最终分析结果：\n{ai_content2}")
         print("="*94 + "\n")
 
         # 尝试清理 Markdown 标识符并解析 JSON
         try:
-            json_str = re.sub(r'^```json\s*|```\s*$', '', ai_content.strip(), flags=re.MULTILINE)
+            json_str = re.sub(r'^```json\s*|```\s*$', '', ai_content2.strip(), flags=re.MULTILINE)
             parsed_data = json.loads(json_str)
             selected_q = parsed_data.get('selected_question')
         except json.JSONDecodeError:
