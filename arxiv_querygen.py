@@ -139,6 +139,7 @@ HTML_TEMPLATE = """
         <div class="btn-container">
             <div id="loading">正在加载数据...</div>
             <button onclick="fetchRandomRecord()">🎲 随机挑选一个</button>
+            <button id="evalBtn" onclick="evaluatePaper()" style="background-color: #8e44ad; margin-left: 15px;">🔍 自动评估适用性</button>
             <button id="autoGenTopBtn" onclick="autoGenerateAndSave()" style="background-color: #27ae60; margin-left: 15px;">🤖 自动生成并存入CSV</button>
         </div>
 
@@ -162,6 +163,11 @@ HTML_TEMPLATE = """
 
             <div class="label">版本记录:</div>
             <div id="versions" class="content" style="font-size: 0.85em; color: #666;"></div>
+        </div>
+
+        <div id="eval_result_container" class="card" style="display:none; margin-top:20px; border-left: 4px solid #3498db; background: #f0f8ff;">
+            <div class="label" style="margin-top:0; color: #2c3e50;">🤖 AI 适用性评估结果:</div>
+            <div id="eval_result" class="content" style="margin-top: 10px; line-height: 1.6;"></div>
         </div>
 
         <div class="card" style="margin-top: 40px; border-top: 3px solid #333;">
@@ -251,6 +257,47 @@ HTML_TEMPLATE = """
         
         // 每 2 秒拉取一次后台结果
         setInterval(pollResults, 2000);
+
+        async function evaluatePaper() {
+            const btn = document.getElementById('evalBtn');
+            const evalContainer = document.getElementById('eval_result_container');
+            const evalResult = document.getElementById('eval_result');
+
+            btn.textContent = '⏳ 正在评估...';
+            btn.disabled = true;
+
+            const paperData = {
+                title: document.getElementById('title').textContent,
+                update_date: document.getElementById('update_date').textContent,
+                categories: document.getElementById('categories').textContent,
+                abstract: document.getElementById('abstract').textContent
+            };
+
+            try {
+                const response = await fetch('/api/evaluate_paper', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(paperData)
+                });
+                const resData = await response.json();
+
+                evalContainer.style.display = 'block';
+                if (resData.suitable) {
+                    evalContainer.style.borderLeftColor = '#27ae60';
+                    evalContainer.style.backgroundColor = '#eafaf1';
+                    evalResult.innerHTML = `<strong>✅ 适合作为灵感源</strong><br><strong>原因:</strong> ${resData.reason}`;
+                } else {
+                    evalContainer.style.borderLeftColor = '#e74c3c';
+                    evalContainer.style.backgroundColor = '#fdedec';
+                    evalResult.innerHTML = `<strong>❌ 不推荐使用</strong><br><strong>原因:</strong> ${resData.reason}`;
+                }
+            } catch (err) {
+                showToast('❌ 评估异常：' + err, true);
+            } finally {
+                btn.textContent = '🔍 自动评估适用性';
+                btn.disabled = false;
+            }
+        }
 
         async function autoGenerateAndSave() {
             const promptStr = document.getElementById('plain_text_area').value;
@@ -361,6 +408,8 @@ HTML_TEMPLATE = """
                 document.getElementById('versions').textContent = versionsText;
                 
                 resultDiv.style.display = 'block';
+                document.getElementById('eval_result_container').style.display = 'none';
+                document.getElementById('eval_result').innerHTML = '';
                 
                 if (isFirstLoad) {
                     showToast('✅ 数据集加载成功，现在可以开始光速挑选了！');
@@ -387,10 +436,115 @@ HTML_TEMPLATE = """
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+def get_llm_config():
+    """获取大模型配置信息"""
+    api_key = os.environ.get("LLM_API_KEY", "your-api-key")
+    api_base = os.environ.get("LLM_API_BASE", "https://api.openai.com/v1")
+    model_name = os.environ.get("LLM_MODEL", "gpt-3.5-turbo")
+    
+    config_path = "config.json"
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+                api_key = config_data.get("LLM_API_KEY", api_key)
+                api_base = config_data.get("LLM_API_BASE", api_base)
+                model_name = config_data.get("LLM_MODEL", model_name)
+        except Exception as e:
+            print(f"配置文件读取失败: {e}")
+            
+    api_base = api_base.rstrip('/')
+    return api_key, api_base, model_name
+
+def is_paper_suitable_for_query(row):
+    """
+    使用大模型评估随机选出的论文是否适合用作问题生成的灵感源。
+    返回 (bool, str): (是否合适, 不合适的原因)
+    """
+    try:
+        # 首先用机械规则过滤极其不合理的（比如没有摘要的情况），节省一部分 Token 消耗
+        abstract = str(row.get('abstract', '')).strip()
+        if len(abstract) < 50:
+            return False, "摘要过短，机械规则前置过滤"
+
+        api_key, api_base, model_name = get_llm_config()
+        
+        current_year = datetime.datetime.now().year
+        prompt = (
+            f"当前系统年份是 {current_year} 年。请评估以下 arXiv 论文是否适合作为生成“论文检索查询问题”的灵感源。\n"
+            "判断不适合的标准如下，请你结合论文的领域类别和具体研究内容进行灵活、智能的判断：\n"
+            "1. 论文发表时间与领域发展速度的匹配度。请你自行分析该细分领域的迭代速度：\n"
+            "   - 对于新兴、快速迭代或高速发展的细分方向（如大模型、前沿生物技术、量子计算等任何快速发展学科），审查要从严，要求尽量在 2020 年及以后发表。\n"
+            "   - 对于发展相对缓慢、注重基础理论或传统的方法的分支（无论是数学、物理还是 CS 中的传统基础理论分支），时间要求可适当放宽，但最多放宽至 2009 年及以后。\n"
+            "   - 绝对不接受 2009 年以前的古早论文。\n"
+            "2. 即使论文日期较新，如果明确探讨的是已被业界公认淘汰、过时或不再具有研究价值的技术论题，也应视为不适合。\n"
+            "3. 摘要内容过短、过于空洞或缺乏具体的研究实体/概念，难以激起生成自然查询问题的灵感。\n\n"
+            "请根据上述条件对以下论文进行分析：\n"
+            f"标题：{row.get('title')}\n"
+            f"日期：{row.get('update_date')}\n"
+            f"领域类别：{row.get('categories')}\n"
+            f"摘要：{abstract}\n\n"
+            "请严格输出 JSON，不要添加多余 Markdown 格式，格式如下：\n"
+            "{\n"
+            '  "suitable": true 或 false,\n'
+            '  "reason": "你的判断理由，请简要说明"\n'
+            "}"
+        )
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": "你是一个专业的学术评价助手。"},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3
+        }
+
+        response = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=20)
+        response.raise_for_status()
+        
+        reply_json = response.json()
+        ai_content = reply_json.get('choices', [{}])[0].get('message', {}).get('content', '')
+        
+        # 尝试清理 Markdown 标识符并解析 JSON
+        json_str = re.sub(r'^```json\s*|```\s*$', '', ai_content.strip(), flags=re.MULTILINE)
+        parsed_data = json.loads(json_str)
+        
+        is_suitable = bool(parsed_data.get('suitable', False))
+        reason = parsed_data.get('reason', 'JSON中无理由')
+        
+        return is_suitable, reason
+        
+    except Exception as e:
+        # LLM 解析或请求异常时，权宜之计默认返回 False 促使其继续抽换下一篇
+        return False, f"LLM评估发生错误: {e}"
+
+@app.route('/api/evaluate_paper', methods=['POST'])
+def evaluate_paper():
+    try:
+        data = request.get_json()
+        print(f"\n[LLM 手动评估] 正在验证论文的适用性: 《{data.get('title')}》")
+        is_suitable, reason = is_paper_suitable_for_query(data)
+        print(f"[LLM 手动评估] 结果: {'✅ 适合' if is_suitable else '❌ 不适合'} | 原因: {reason}\n")
+        
+        return jsonify({
+            "suitable": is_suitable,
+            "reason": reason
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/random')
 def get_random():
     df = load_data()
-    idx = random.randint(0, len(df) - 1)
+    total_len = len(df)
+    
+    idx = random.randint(0, total_len - 1)
     row = df.iloc[idx].to_dict()
     
     # 深度递归清理 ndarray，因为 versions 和 authors_parsed 可能是嵌套数组
