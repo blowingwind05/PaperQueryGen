@@ -35,6 +35,7 @@ app.json = CustomJSONProvider(app)
 
 # 全局变量存储数据，避免重复读取
 DF = None
+data_load_lock = threading.Lock()
 
 # 后台任务队列与完成结果暂存
 generation_queue = queue.Queue()
@@ -76,9 +77,11 @@ def load_data():
     global DF
     file_path = "arxiv-metadata-oai-snapshot.parquet"
     if DF is None:
-        print("正在从 Parquet 文件加载数据...")
-        DF = pd.read_parquet(file_path)
-        print(f"成功加载 {len(DF)} 条数据")
+        with data_load_lock:
+            if DF is None:
+                print("正在从 Parquet 文件加载数据...")
+                DF = pd.read_parquet(file_path)
+                print(f"成功加载 {len(DF)} 条数据")
     return DF
 
 # HTML 模板 - 传统三件套结合 (HTML + CSS + JS)
@@ -118,6 +121,17 @@ HTML_TEMPLATE = """
         #queue-header { font-weight: bold; }
         #queue-list { display: none; list-style: none; padding: 0; margin: 10px 0 0 0; font-size: 12px; max-height: 300px; overflow-y: auto; border-top: 1px dashed #ccc; padding-top: 10px;}
         #queue-list li { margin-bottom: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #555;}
+        
+        /* 滑动开关样式 */
+        .mode-toggle { display: flex; justify-content: center; margin-bottom: 25px; }
+        .toggle-bg { position: relative; width: 240px; height: 40px; background: #e0e0e0; border-radius: 20px; display: flex; cursor: pointer; box-shadow: inset 0 1px 3px rgba(0,0,0,0.1); }
+        .toggle-slider { position: absolute; top: 2px; left: 2px; width: 116px; height: 36px; background: #fff; border-radius: 18px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); }
+        .toggle-option { flex: 1; z-index: 1; display: flex; justify-content: center; align-items: center; font-weight: bold; color: #7f8c8d; transition: color 0.3s; user-select: none; font-size: 14px; }
+        .toggle-bg.auto .toggle-slider { transform: translateX(120px); }
+        .toggle-bg.auto .opt-manual { color: #7f8c8d; }
+        .toggle-bg.auto .opt-auto { color: #2c3e50; }
+        .toggle-bg:not(.auto) .opt-manual { color: #2c3e50; }
+        .toggle-bg:not(.auto) .opt-auto { color: #7f8c8d; }
     </style>
 </head>
 <body>
@@ -136,11 +150,68 @@ HTML_TEMPLATE = """
         <h1>📚 arXiv QueryGen</h1>
         <p style="text-align: center; color: #7f8c8d; margin-top: -10px; margin-bottom: 25px;">学术检索 RAG 测试集自动化构建工具</p>
         
-        <div class="btn-container">
-            <div id="loading">正在加载数据...</div>
+        <!-- 模式切换开关 -->
+        <div class="mode-toggle">
+            <div class="toggle-bg" id="modeToggleBg" onclick="toggleMode()">
+                <div class="toggle-slider"></div>
+                <div class="toggle-option opt-manual">⌨️ 手动模式</div>
+                <div class="toggle-option opt-auto">💻 自动模式</div>
+            </div>
+        </div>
+
+        <!-- 自动模式区域 -->
+        <div id="auto-mode-section" style="display: none;">
+            <div class="card" style="background: #fffdf5; border-color: #f1c40f;">
+                <h2 style="color: #f39c12; margin-top:0; margin-bottom: 20px;">💻 全自动探索与生成流水线</h2>
+                
+                <!-- 控制面板 -->
+                <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px; align-items: center;">
+                    <div>
+                        <span class="label" style="display: inline; margin-right: 5px; margin-top:0;">生成目标数量:</span>
+                        <input type="number" id="autoTargetCount" value="50" style="padding: 5px; width: 80px; text-align: center; border: 1px solid #ccc; border-radius: 4px;">
+                    </div>
+                    <div>
+                        <span class="label" style="display: inline; margin-right: 5px; margin-top:0;">最大尝试倍率:</span>
+                        <input type="number" id="autoMaxMultiplier" value="2" step="0.5" style="padding: 5px; width: 60px; text-align: center; border: 1px solid #ccc; border-radius: 4px;" title="尝试次数超过 [目标数量 × 该倍率] 时报错停止，例: 目标50, 倍率2, 则最多尝试100次">
+                    </div>
+                    <div>
+                        <span class="label" style="display: inline; margin-right: 5px; margin-top:0;">API错误最大重试:</span>
+                        <input type="number" id="autoMaxRetries" value="3" style="padding: 5px; width: 60px; text-align: center; border: 1px solid #ccc; border-radius: 4px;" title="遇到请求失败、超时等错误时的最大重试次数">
+                    </div>
+                    <div style="flex-grow: 1;">
+                        <span style="font-size: 12px; color: #7f8c8d; font-style: italic;">(流水线并行模式开发中，当前为串行安全模式)</span>
+                    </div>
+                    <button id="autoStartBtn" onclick="startAutoMode()" style="background-color: #27ae60; padding: 10px 25px; font-weight: bold;">▶ 开始生成</button>
+                    <button id="autoStopBtn" onclick="stopAutoMode()" style="background-color: #e74c3c; padding: 10px 25px; font-weight: bold; display: none;">⏹ 停止并结算</button>
+                </div>
+
+                <!-- 状态与进度 -->
+                <div style="margin-bottom: 20px; padding: 15px; background: #fff; border: 1px solid #eee; border-radius: 8px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; color: #34495e;">
+                        <span><strong>成功生成:</strong> <span id="autoProgressText">0</span> / <span id="autoTargetText">50</span></span>
+                        <span><strong>总尝试抽样:</strong> <span id="autoAttemptsText">0</span></span>
+                        <span><strong>丢弃/不适用:</strong> <span id="autoDiscardText">0</span> (<span id="autoFilterRate">0%</span>)</span>
+                    </div>
+                    <div style="width: 100%; height: 16px; background-color: #ecf0f1; border-radius: 8px; overflow: hidden; border: 1px solid #bdc3c7;">
+                        <div id="autoProgressBar" style="width: 0%; height: 100%; background: linear-gradient(90deg, #2ecc71, #27ae60); transition: width 0.3s ease-in-out;"></div>
+                    </div>
+                </div>
+
+                <!-- 实时终端日志 -->
+                <div class="label" style="margin-top:0px;">实时运行终端:</div>
+                <div id="autoConsole" style="background: #1e1e1e; color: #2ecc71; font-family: 'Courier New', Courier, monospace; font-size: 13px; padding: 12px; border-radius: 6px; height: 180px; overflow-y: auto; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.6;">
+                    > 系统已就绪，等待启动参数...<br>
+                </div>
+            </div>
+        </div>
+
+        <!-- 手动模式区域 (之前的全部内容) -->
+        <div id="manual-mode-section">
+            <div class="btn-container">
+                <div id="loading">正在加载数据...</div>
             <button onclick="fetchRandomRecord()">🎲 随机挑选一个</button>
             <button id="evalBtn" onclick="evaluatePaper()" style="background-color: #8e44ad; margin-left: 15px;">🔍 自动评估适用性</button>
-            <button id="autoGenTopBtn" onclick="autoGenerateAndSave()" style="background-color: #27ae60; margin-left: 15px;">🤖 自动生成并存入CSV</button>
+            <button id="autoGenTopBtn" onclick="autoGenerateAndSave()" style="background-color: #27ae60; margin-left: 15px;">💻 自动生成并存入CSV</button>
         </div>
 
         <div id="result" class="card" style="display:none;">
@@ -179,11 +250,39 @@ HTML_TEMPLATE = """
             </div>
             <textarea id="plain_text_area" readonly style="width: 100%; height: 200px; padding: 10px; border: 1px dashed #ccc; border-radius: 4px; font-family: monospace; font-size: 14px; background-color: #fafafa;"></textarea>
         </div>
+        </div> <!-- end #manual-mode-section -->
     </div>
     
     <div id="toast"></div>
 
     <script>
+        let isAutoRunning = false; // 标记自动模式是否正在执行
+
+        // 模式切换
+        function toggleMode() {
+            const bg = document.getElementById('modeToggleBg');
+            const manualSec = document.getElementById('manual-mode-section');
+            const autoSec = document.getElementById('auto-mode-section');
+            
+            if (bg.classList.contains('auto')) {
+                // 如果在自动模式且正在运行，阻止切换并弹窗提示
+                if (isAutoRunning) {
+                    alert(`⚠️ 警告：当前正有自动生成任务在进行中！\n请先点击【⏹ 停止并结算】终止任务，然后再切换回手动模式。`);
+                    return;
+                }
+                
+                // 回到手动模式
+                bg.classList.remove('auto');
+                manualSec.style.display = 'block';
+                autoSec.style.display = 'none';
+            } else {
+                // 切换到自动模式
+                bg.classList.add('auto');
+                manualSec.style.display = 'none';
+                autoSec.style.display = 'block';
+            }
+        }
+
         let toastTimeout = null;
         function showToast(message, isError = false) {
             const toast = document.getElementById('toast');
@@ -204,10 +303,16 @@ HTML_TEMPLATE = """
         }
 
         // 定时轮询后端查看是否有后台任务完成
+        let currentQueueSize = 0;
+        let isProcessing = false;
+        
         function pollResults() {
             fetch('/api/poll_results')
                 .then(res => res.json())
                 .then(resData => {
+                    currentQueueSize = resData.queue_size;
+                    isProcessing = !!resData.current_processing;
+                    
                     // 更新右上角悬浮窗的队列数量和列表
                     const queueElem = document.getElementById('queue-status');
                     const listElem = document.getElementById('queue-list');
@@ -299,6 +404,161 @@ HTML_TEMPLATE = """
             }
         }
 
+        let autoStopFlag = false;
+
+        function stopAutoMode() {
+            autoStopFlag = true;
+            const consoleEl = document.getElementById('autoConsole');
+            consoleEl.innerHTML += `<br>[${new Date().toLocaleTimeString('en-US', {hour12: false})}] <span style="color:#e74c3c;">🛑 正在停止自动任务，等待当前操作结束后终止...</span><br>`;
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+
+        async function startAutoMode() {
+            // 参数读取与保护
+            const targetCount = parseInt(document.getElementById('autoTargetCount').value) || 50;
+            const maxMultiplier = parseFloat(document.getElementById('autoMaxMultiplier').value) || 2;
+            const maxRetries = parseInt(document.getElementById('autoMaxRetries').value) || 3;
+            const maxAttempts = Math.ceil(targetCount * maxMultiplier);
+            
+            if (targetCount <= 0 || maxMultiplier < 1) {
+                alert('请填写合理的生成目标的数量与倍率阈值');
+                return;
+            }
+            
+            if (currentQueueSize > 0 || isProcessing) {
+                alert('请等待当前后台队列中的残留任务彻底结束，再启动全新自动流水线');
+                return;
+            }
+
+            isAutoRunning = true;
+            autoStopFlag = false;
+            
+            // 切换按钮状态
+            document.getElementById('autoStartBtn').style.display = 'none';
+            document.getElementById('autoStopBtn').style.display = 'inline-block';
+            
+            // 初始化计量器
+            let generatedCount = 0;
+            let totalAttempts = 0;
+            let discardCount = 0;
+            
+            document.getElementById('autoTargetText').textContent = targetCount;
+            document.getElementById('autoProgressText').textContent = generatedCount;
+            document.getElementById('autoAttemptsText').textContent = totalAttempts;
+            document.getElementById('autoDiscardText').textContent = discardCount;
+            document.getElementById('autoFilterRate').textContent = '0%';
+            document.getElementById('autoProgressBar').style.width = '0%';
+            
+            const consoleEl = document.getElementById('autoConsole');
+            consoleEl.innerHTML = `> 🚀 自动生成流水线启动！目标: ${targetCount} 组 (最长允许摸排 ${maxAttempts} 篇)<br>`;
+            
+            const log = (msg) => {
+                const time = new Date().toLocaleTimeString('en-US', {hour12: false});
+                consoleEl.innerHTML += `[${time}] ${msg}<br>`;
+                consoleEl.scrollTop = consoleEl.scrollHeight;
+            };
+
+            let retryCount = 0;
+            
+            // 核心循环
+            while (!autoStopFlag && generatedCount < targetCount && totalAttempts < maxAttempts) {
+                try {
+                    log(`🎲 正在抽取随机论文...`);
+                    const fetchRes = await fetch('/api/random');
+                    if (!fetchRes.ok) throw new Error(`抽样请求失败 (HTTP ${fetchRes.status})`);
+                    const paperData = await fetchRes.json();
+                    
+                    if (autoStopFlag) break;
+                    
+                    totalAttempts++;
+                    const shortTitle = paperData.title.length > 30 ? paperData.title.substring(0, 30) + '...' : paperData.title;
+                    log(`🤖 正在评估适用性: 《${shortTitle}》`);
+                    
+                    const evalRes = await fetch('/api/evaluate_paper', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(paperData)
+                    });
+                    if (!evalRes.ok) throw new Error(`评估请求失败 (HTTP ${evalRes.status})`);
+                    const evalData = await evalRes.json();
+                    
+                    if (autoStopFlag) break;
+                    
+                    // 重置报错计数
+                    retryCount = 0;
+
+                    if (evalData.suitable) {
+                        log(`✅ 适用性评估通过！投递到大语言模型进行 Query 生成...`);
+                        const plainText = `${PROMPT_PREFIX}标题：${paperData.title}\n日期：${paperData.update_date}\n作者：${paperData.authors}\n摘要：${paperData.abstract}`;
+                        
+                        const genRes = await fetch('/api/generate_and_save', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ prompt: plainText, title: paperData.title })
+                        });
+                        if (!genRes.ok) throw new Error(`提交生成任务失败 (HTTP ${genRes.status})`);
+                        
+                        // 串行执行逻辑：每投递一篇，必须耐心等待其从后台队列完全消化掉才继续
+                        log(`⏳ 任务已入队，[串行安全模式] 正等待大模型生成并写入CSV...`);
+                        let hasStartedProcessing = false;
+                        while (!autoStopFlag) {
+                            await new Promise(r => setTimeout(r, 1500)); // 给心跳时间
+                            if (currentQueueSize > 0 || isProcessing) {
+                                hasStartedProcessing = true;
+                            } else if (hasStartedProcessing && currentQueueSize === 0 && !isProcessing) {
+                                // 已经开始过且目前队列和执行都清空，说明执行完毕
+                                break;
+                            } else if (currentQueueSize === 0 && !isProcessing) {
+                                // 可能刚好 pollInterval 没拉到最新状态或者后台瞬间执行完毕（概率极小）
+                                // 容错重试多等一秒判断
+                                await new Promise(r => setTimeout(r, 1000));
+                                if (currentQueueSize === 0 && !isProcessing) break;
+                            }
+                        }
+                        
+                        if (autoStopFlag) break;
+                        
+                        generatedCount++;
+                        log(`✨ <span style="color:#f39c12;">当前论文生成并落库完毕！当前进度: ${generatedCount} / ${targetCount}</span>`);
+                        
+                    } else {
+                        discardCount++;
+                        log(`❌ 论文不适用，已丢弃。(原因: <span style="color:#e74c3c;">${evalData.reason}</span>)`);
+                    }
+                    
+                    // 刷新状态盘数据
+                    document.getElementById('autoProgressText').textContent = generatedCount;
+                    document.getElementById('autoAttemptsText').textContent = totalAttempts;
+                    document.getElementById('autoDiscardText').textContent = discardCount;
+                    document.getElementById('autoFilterRate').textContent = Math.round((discardCount / totalAttempts) * 100) + '%';
+                    document.getElementById('autoProgressBar').style.width = Math.round((generatedCount / targetCount) * 100) + '%';
+                    
+                } catch (err) {
+                    retryCount++;
+                    log(`<span style="color:#e74c3c;">⚠️ 发生意外错误: ${err.message} (第 ${retryCount}/${maxRetries} 次重试)</span>`);
+                    if (retryCount > maxRetries) {
+                        log(`<span style="color:#e74c3c;">🚨 连续网络崩溃或大对象拦截超限，流水线强行熔断！</span>`);
+                        break;
+                    }
+                    await new Promise(r => setTimeout(r, 2000));
+                }
+            } // end while
+            
+            // 结算语
+            if (generatedCount >= targetCount) {
+                log(`🎉 <strong style="color:white; background:#27ae60; padding:2px 5px;">达成目标容量！成功生产并通过筛选 ${targetCount} 组问答指令。</strong>`);
+            } else if (totalAttempts >= maxAttempts) {
+                log(`🛑 达到尝试倍率极值上限 (${maxAttempts}抽样)，可能当前科研方向可选取样本过少，已自动停机。`);
+            } else {
+                log(`🛑 流水线已人工停止或熔断退出，最终生产 ${generatedCount} 条结果。`);
+            }
+            
+            // 状态还原
+            document.getElementById('autoStartBtn').style.display = 'inline-block';
+            document.getElementById('autoStopBtn').style.display = 'none';
+            isAutoRunning = false;
+        }
+
         async function autoGenerateAndSave() {
             const promptStr = document.getElementById('plain_text_area').value;
             const paperTitle = document.getElementById('title').textContent || '未知论文';
@@ -309,7 +569,7 @@ HTML_TEMPLATE = """
             }
             
             const btn = document.getElementById('autoGenTopBtn');
-            const originalText = '🤖 自动生成并存入CSV';
+            const originalText = '💻 自动生成并存入CSV';
             btn.textContent = '⏳ 请求已加入队列...';
             btn.disabled = true;
             btn.style.backgroundColor = '#95a5a6';
@@ -740,5 +1000,5 @@ if __name__ == '__main__':
     # 为了让前端页面迅速打开并显示 loading 动画，取消启动时的同步载入阻塞
     # 第一次 /api/random 调用时才会触发 Parquet 加载
     
-    # 默认运行在 5000 端口，关闭 debug 模式，禁用重载功能
-    app.run(debug=False, use_reloader=False, port=5000)
+    # 默认运行在 5050 端口，避开 macOS 默认占用的 5000 端口（Control Center / AirPlay），关闭 debug 模式，禁用重载功能
+    app.run(debug=False, use_reloader=False, port=5050)
